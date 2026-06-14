@@ -1,5 +1,7 @@
 # VPN Launcher Pro
 
+Made with ❤️ from Kenya 🇰🇪
+
 A simple GUI for switching between OpenVPN profiles on Linux — no terminal required.
 
 Built for people who use **HackTheBox**, **TryHackMe**, **OffSec/PG** and similar platforms where you juggle multiple `.ovpn` files and want to connect without typing `sudo openvpn --config ...` every time.
