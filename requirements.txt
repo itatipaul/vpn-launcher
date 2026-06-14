@@ -1,0 +1,13 @@
+# VPN Launcher Pro — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt --break-system-packages
+#
+# All other dependencies (openvpn, pkexec, python3-tk, fonts-dejavu)
+# are system packages — see README.md for distro-specific install commands.
+
+Pillow>=9.0.0    # image resizing for window icon (avoids X11 BadLength on large PNGs)
+pystray>=0.19.0  # system tray icon support
+
+# WireGuard support requires wireguard-tools system package:
+#   sudo apt install wireguard-tools
