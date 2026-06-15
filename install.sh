@@ -9,12 +9,15 @@ ok()    { echo -e "${G}[+]${N} $*"; }
 err()   { echo -e "${R}[!]${N} $*"; exit 1; }
 
 # ── Prereq check ──────────────────────────────────────────────────────────
-for cmd in python3 openvpn pkexec wg-quick; do
+for cmd in python3 openvpn pkexec wg-quick ip; do
     command -v "$cmd" &>/dev/null || err "missing dependency: $cmd"
 done
 python3 -c "import tkinter" 2>/dev/null || err "missing python3-tk  (sudo apt install python3-tk)"
 python3 -c "import PIL" 2>/dev/null      || err "missing Pillow  (pip install pillow --break-system-packages)"
-python3 -c "import pystray" 2>/dev/null    || err "missing pystray (pip install pystray --break-system-packages)"
+python3 -c "import pystray" 2>/dev/null  || err "missing pystray (pip install pystray --break-system-packages)"
+# DejaVu Mono is used throughout the UI — warn if missing (non-fatal; falls back to system mono)
+fc-list 2>/dev/null | grep -qi "DejaVu" || \
+    info "optional: DejaVu fonts not found — install with: sudo apt install fonts-dejavu"
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,15 +45,21 @@ ok "icon installed"
 INSTALL_USER="${SUDO_USER:-$USER}"
 if [ -d "$POLKIT_DIR" ]; then
     info "Installing polkit rule → $POLKIT_RULE  (scoped to user: $INSTALL_USER)"
+    # Resolve absolute paths for sh and wg-quick so the rule is as narrow as possible.
+    SH_PATH="$(command -v sh)"
+    WGQUICK_PATH="$(command -v wg-quick)"
     sudo tee "$POLKIT_RULE" > /dev/null << EOF
-// Allow $INSTALL_USER to run pkexec sh (for openvpn disconnect) without a password.
+// Allow $INSTALL_USER to run pkexec for openvpn disconnect (sh) and WireGuard (wg-quick)
+// without a password prompt. Scoped to the exact binaries and the installing user only.
 // Installed by vpn-launcher install.sh — safe to remove with uninstall.sh.
 polkit.addRule(function(action, subject) {
     if (action.id === "org.freedesktop.policykit.exec" &&
-        action.lookup("program") === "/bin/sh" &&
         subject.user === "$INSTALL_USER" &&
         subject.local && subject.active) {
-        return polkit.Result.YES;
+        var prog = action.lookup("program");
+        if (prog === "$SH_PATH" || prog === "$WGQUICK_PATH") {
+            return polkit.Result.YES;
+        }
     }
 });
 EOF
