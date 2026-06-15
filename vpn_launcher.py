@@ -55,6 +55,10 @@ class VPNLauncher(tk.Tk):
         self._blink_on  = True
         self._tray_icon = None
         self._tray_thread = None
+        self._process_lock = threading.Lock()   # guards self.process cross-thread writes
+        self._wg_active = False                 # WireGuard tunnel is up (wg-quick exits immediately)
+        self._connecting = False                # prevents double-click races
+        self._ip_probe_cancel = threading.Event()  # signals probe thread to stop
 
         self._build()
         self.load_profiles()
@@ -515,8 +519,18 @@ class VPNLauncher(tk.Tk):
         self._status_bar_text.configure(text=msg)
 
     def connect(self):
-        # Prevent multiple VPN instances
-        if self.process and self.process.poll() is None:
+        # Prevent double-click / race: covers both OpenVPN (long-running process)
+        # and WireGuard (wg-quick exits immediately after bringing the tunnel up).
+        already_running = False
+        with self._process_lock:
+            if self._connecting:
+                already_running = True
+            elif self._wg_active:
+                already_running = True
+            elif self.process and self.process.poll() is None:
+                already_running = True
+
+        if already_running:
             self.write_log("vpn already running", "warn")
             messagebox.showwarning(
                 "VPN Running",
@@ -542,8 +556,31 @@ class VPNLauncher(tk.Tk):
             )
             return
 
-        # Detect protocol from filename extension
-        kind = "wg" if self._selected.endswith(".conf") else "ovpn"
+        # Detect protocol. For .conf files, confirm it's actually WireGuard by
+        # checking for a [Interface] section — avoids running arbitrary configs as root.
+        if self._selected.endswith(".conf"):
+            try:
+                with open(profile, "r", errors="replace") as fh:
+                    contents = fh.read(4096)
+                if "[Interface]" not in contents:
+                    self.write_log(
+                        f"'{self._selected}' does not look like a WireGuard config (no [Interface] section)", "err")
+                    messagebox.showerror(
+                        "Invalid Config",
+                        f"'{self._selected}' does not appear to be a WireGuard configuration file.\n\n"
+                        "Only files containing a [Interface] section will be run."
+                    )
+                    return
+            except OSError as exc:
+                self.write_log(f"could not read profile: {exc}", "err")
+                return
+            kind = "wg"
+        else:
+            kind = "ovpn"
+
+        # Atomically mark as connecting before spawning the thread.
+        with self._process_lock:
+            self._connecting = True
 
         # Remember the active config and type so disconnect knows what to do.
         self._active_profile = profile
@@ -571,7 +608,10 @@ class VPNLauncher(tk.Tk):
                     bufsize=1,
                     start_new_session=True
                 )
-                self.process = proc
+                with self._process_lock:
+                    self.process = proc
+                    self._connecting = False
+
                 connected = False
 
                 for line in proc.stdout:
@@ -598,9 +638,26 @@ class VPNLauncher(tk.Tk):
                     self.after(0, lambda l=line, t=tag: self.write_log(l, t))
 
                     if "INITIALIZATION SEQUENCE COMPLETED" in upper:
+                        # Cancel any previous IP probe that may still be running.
+                        self._ip_probe_cancel.set()
+                        self._ip_probe_cancel = threading.Event()
+                        cancel_event = self._ip_probe_cancel
+
+                        if not connected:
+                            # First connect: start the uptime timer.
+                            self.after(0, self._on_connected)
+                        else:
+                            # Reconnect after ping-restart: update UI without
+                            # resetting the timer or double-logging "connected".
+                            self.after(0, lambda: (
+                                self._title_status.configure(text="[ CONNECTED ]", fg=SUCCESS),
+                                self._lbl_status.configure(text="ONLINE", fg=SUCCESS),
+                                self._set_statusbar(f"tunnel up  ▸  {self._selected}"),
+                                self._update_tray_title(connected=True, profile=self._selected or ""),
+                                self.write_log("tunnel reconnected", "ok"),
+                            ))
                         connected = True
-                        self.after(0, self._on_connected)
-                        self.after(0, lambda: self._fetch_tunnel_ip("tun"))
+                        self.after(0, lambda ce=cancel_event: self._fetch_tunnel_ip("tun", cancel=ce))
 
                     elif (
                         "AUTH_FAILED" in upper
@@ -616,12 +673,16 @@ class VPNLauncher(tk.Tk):
                         ))
 
                 rc = proc.wait()
+                with self._process_lock:
+                    self._connecting = False
                 if rc != 0 and not connected:
                     self.after(0, lambda rc=rc: self.write_log(
                         f"openvpn exited with code {rc}", "err"))
 
             except Exception as e:
                 err = str(e)
+                with self._process_lock:
+                    self._connecting = False
                 self.after(0, lambda err=err: (
                     self.write_log(err, "err"),
                     messagebox.showerror("OpenVPN Error", err)
@@ -645,7 +706,8 @@ class VPNLauncher(tk.Tk):
                     bufsize=1,
                     start_new_session=True
                 )
-                self.process = proc
+                with self._process_lock:
+                    self.process = proc
 
                 for line in proc.stdout:
                     line = line.rstrip()
@@ -660,9 +722,20 @@ class VPNLauncher(tk.Tk):
 
                 rc = proc.wait()
 
+                # Cancel any stale IP probe before starting a new one.
+                self._ip_probe_cancel.set()
+                self._ip_probe_cancel = threading.Event()
+                cancel_event = self._ip_probe_cancel
+
+                with self._process_lock:
+                    self._connecting = False
+                    if rc == 0:
+                        self._wg_active = True
+
                 if rc == 0:
                     self.after(0, self._on_connected)
-                    self.after(0, lambda: self._fetch_tunnel_ip(iface, exact=True))
+                    self.after(0, lambda ce=cancel_event: self._fetch_tunnel_ip(
+                        iface, exact=True, cancel=ce))
                     self.after(0, lambda: self.write_log(
                         f"wireguard tunnel up  ▸  {iface}", "ok"))
                 else:
@@ -675,6 +748,8 @@ class VPNLauncher(tk.Tk):
 
             except Exception as e:
                 err = str(e)
+                with self._process_lock:
+                    self._connecting = False
                 self.after(0, lambda err=err: (
                     self.write_log(err, "err"),
                     messagebox.showerror("WireGuard Error", err)
@@ -682,49 +757,64 @@ class VPNLauncher(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _fetch_tunnel_ip(self, iface_hint, exact=False):
+    def _fetch_tunnel_ip(self, iface_hint, exact=False, cancel=None):
         """Read tunnel IP via `ip addr`.
 
         iface_hint — for OpenVPN pass prefix "tun"; for WireGuard pass
                      the exact interface name (e.g. "wg0").
-        exact      — if True query iface_hint directly; otherwise scan all
-                     interfaces whose name starts with iface_hint.
+        exact      — if True query iface_hint directly; otherwise find the
+                     first interface whose name starts with iface_hint using
+                     `ip -o` (one-line-per-interface) to avoid false matches.
+        cancel     — threading.Event; probe exits early when set.
         """
         import re
+        if cancel is None:
+            cancel = threading.Event()
+
         def probe():
             for _ in range(10):
+                if cancel.is_set():
+                    return
                 try:
                     if exact:
-                        out = subprocess.check_output(
-                            ["ip", "-4", "addr", "show", iface_hint],
-                            stderr=subprocess.DEVNULL, text=True)
-                        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-                        if m:
-                            ip = m.group(1)
-                            self.after(0, lambda ip=ip: self._lbl_ip.configure(
-                                text=ip, fg=SUCCESS))
-                            self.after(0, lambda ip=ip: self.write_log(
-                                f"tunnel ip  ▸  {ip}", "ok"))
-                            return
+                        # Direct lookup by exact interface name.
+                        iface = iface_hint
                     else:
+                        # Use `ip -o -4 addr` (one line per address) so we can
+                        # reliably match interface names without splitting on
+                        # blank lines and risk picking up 127.0.0.1 from lo.
                         out = subprocess.check_output(
-                            ["ip", "-4", "addr"],
+                            ["ip", "-o", "-4", "addr"],
                             stderr=subprocess.DEVNULL, text=True)
-                        for block in out.split("\n\n"):
-                            if iface_hint in block:
-                                m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", block)
-                                if m:
-                                    ip = m.group(1)
-                                    self.after(0, lambda ip=ip: self._lbl_ip.configure(
-                                        text=ip, fg=SUCCESS))
-                                    self.after(0, lambda ip=ip: self.write_log(
-                                        f"tunnel ip  ▸  {ip}", "ok"))
-                                    return
+                        iface = None
+                        for line in out.splitlines():
+                            # Format: "N: ifname  inet A.B.C.D/prefix ..."
+                            parts = line.split()
+                            if len(parts) >= 4 and parts[1].startswith(iface_hint):
+                                iface = parts[1]
+                                break
+                        if not iface:
+                            time.sleep(0.8)
+                            continue
+
+                    out = subprocess.check_output(
+                        ["ip", "-4", "addr", "show", iface],
+                        stderr=subprocess.DEVNULL, text=True)
+                    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+                    if m and not cancel.is_set():
+                        ip = m.group(1)
+                        self.after(0, lambda ip=ip: self._lbl_ip.configure(
+                            text=ip, fg=SUCCESS))
+                        self.after(0, lambda ip=ip: self.write_log(
+                            f"tunnel ip  ▸  {ip}", "ok"))
+                        return
                 except subprocess.CalledProcessError:
                     pass
                 time.sleep(0.8)
-            self.after(0, lambda: self.write_log(
-                f"could not read ip for interface  ▸  {iface_hint}", "warn"))
+
+            if not cancel.is_set():
+                self.after(0, lambda: self.write_log(
+                    f"could not read ip for interface  ▸  {iface_hint}", "warn"))
 
         threading.Thread(target=probe, daemon=True).start()
 
@@ -753,6 +843,10 @@ class VPNLauncher(tk.Tk):
             self._reset_disconnected_ui()
             return
 
+        # Stop the IP probe immediately so it can't update the label
+        # after we've torn the tunnel down.
+        self._ip_probe_cancel.set()
+
         self.write_log("sending kill order to openvpn (root)", "warn")
         self._set_statusbar("disconnecting…")
         profile = self._active_profile or ""
@@ -773,18 +867,23 @@ class VPNLauncher(tk.Tk):
         profile = self._active_profile or ""
         iface   = os.path.splitext(os.path.basename(profile))[0]
 
-        if not profile:
+        if not profile or not iface:
             self.write_log("no active wireguard profile", "dim")
             self._reset_disconnected_ui()
             return
+
+        # Cancel any running IP probe immediately so it doesn't update
+        # the label after we've torn the interface down.
+        self._ip_probe_cancel.set()
 
         self.write_log(f"bringing down wireguard interface  ▸  {iface}", "warn")
         self._set_statusbar("disconnecting wireguard…")
 
         def worker():
             try:
+                # wg-quick down expects the interface name, not the config path.
                 result = subprocess.run(
-                    ["pkexec", "wg-quick", "down", profile],
+                    ["pkexec", "wg-quick", "down", iface],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True
@@ -811,8 +910,12 @@ class VPNLauncher(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _reset_disconnected_ui(self):
-        self.process = None
-        self._active_profile = None
+        with self._process_lock:
+            self.process = None
+            self._active_profile = None
+            self._active_type = None       # was never reset before — caused stale disconnect routing
+            self._wg_active = False
+            self._connecting = False
 
         self._stop_timer()
 
@@ -854,8 +957,21 @@ class VPNLauncher(tk.Tk):
         """Terminate openvpn as root in a single pkexec call (one prompt).
 
         TERM -> wait -> KILL inside one elevated shell. Returns True on success.
+
+        The profile path is passed as a positional argument ($1) to the shell
+        script — it is never interpolated directly into the script string — which
+        prevents shell injection.  We additionally reject paths containing
+        characters that have no place in a filesystem path (newlines, NUL bytes)
+        as a defence-in-depth measure.
         """
-        # $1 = config path, passed positionally to avoid quoting issues.
+        import re as _re
+        if profile and _re.search(r"[\x00\n\r]", profile):
+            self.after(0, lambda: self.write_log(
+                "kill aborted: profile path contains illegal characters", "err"))
+            return False
+
+        # $1 = config path, passed positionally — never interpolated into the
+        # script string itself, so no quoting/injection risk.
         script = (
             'if [ -n "$1" ]; then '
             '  pkill -TERM -f "openvpn --config $1" 2>/dev/null; '
@@ -871,8 +987,11 @@ class VPNLauncher(tk.Tk):
             'exit 0'
         )
         try:
+            cmd = ["pkexec", "sh", "-c", script, "sh"]
+            if profile:
+                cmd.append(profile)   # becomes $1 inside the script
             subprocess.run(
-                ["pkexec", "sh", "-c", script, "sh", profile],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
