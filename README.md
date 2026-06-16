@@ -6,6 +6,7 @@ A simple GUI for switching between OpenVPN profiles on Linux — no terminal req
 
 Built for people who use **HackTheBox**, **TryHackMe**, **OffSec/PG** and similar platforms where you juggle multiple `.ovpn` files and want to connect without typing `sudo openvpn --config ...` every time.
 
+
 <img width="1920" height="1043" alt="Vpn launcher online" src="https://github.com/user-attachments/assets/fb3416e4-84d2-4ae7-9b3d-d8de2d8b5f15" />
 <img width="1920" height="1030" alt="Vpn launcher offline" src="https://github.com/user-attachments/assets/3cac8deb-4fe4-4b3c-bd03-23566e221d60" />
 
@@ -42,7 +43,6 @@ This replaces all of that with a desktop icon you double-click. Pick a profile, 
 ## Requirements
 
 - Linux (Kali, Ubuntu, Debian, Arch, etc.)
-- X11 or XWayland
 - `openvpn`
 - `polkit` / `pkexec` — for the privilege prompt when connecting
 - `python3-tk` — Tkinter GUI library
