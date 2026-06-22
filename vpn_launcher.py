@@ -6,7 +6,7 @@ Pure tkinter, zero extra deps. Works on X11 and XWayland.
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import subprocess, threading, os, glob, time
+import subprocess, threading, os, glob, time, json
 try:
     import pystray
     from PIL import Image as PILImage
@@ -32,6 +32,8 @@ FONT_MONO  = ("DejaVu Sans Mono", 10)
 FONT_MONO_B= ("DejaVu Sans Mono", 10, "bold")
 FONT_MONO_S= ("DejaVu Sans Mono", 9)
 FONT_MONO_SB=("DejaVu Sans Mono", 9, "bold")
+
+CONFIG_FILE = os.path.expanduser("~/.config/vpn-launcher/config.json")
 
 
 class VPNLauncher(tk.Tk):
@@ -59,6 +61,9 @@ class VPNLauncher(tk.Tk):
         self._wg_active = False                 # WireGuard tunnel is up (wg-quick exits immediately)
         self._connecting = False                # prevents double-click races
         self._ip_probe_cancel = threading.Event()  # signals probe thread to stop
+        self._connect_timeout_id = None         # pending after() id for connection timeout
+
+        self._load_config()
 
         self._build()
         self.load_profiles()
@@ -66,6 +71,32 @@ class VPNLauncher(tk.Tk):
         self.after(100, self._set_window_icon)  # defer until window is mapped
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+
+    # ── Config persistence ─────────────────────────────────────────────────
+
+    def _load_config(self):
+        """Load saved folder path and last-used profile from ~/.config."""
+        try:
+            with open(CONFIG_FILE) as f:
+                data = json.load(f)
+            saved_dir = data.get("vpn_dir", "")
+            if saved_dir and os.path.isdir(saved_dir):
+                self.vpn_dir = saved_dir
+            self._last_profile = data.get("last_profile", "")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self._last_profile = ""
+
+    def _save_config(self):
+        """Persist current folder path and selected profile to ~/.config."""
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({
+                    "vpn_dir": self.vpn_dir,
+                    "last_profile": self._selected or "",
+                }, f, indent=2)
+        except OSError:
+            pass  # non-fatal — config save failure shouldn't crash the app
 
     # ── System tray ────────────────────────────────────────────────────────
 
@@ -375,7 +406,7 @@ class VPNLauncher(tk.Tk):
             font=FONT_MONO_S, bg=SURFACE, fg=MUTED)
         self._status_bar_text.pack(side="left", pady=3)
 
-        tk.Label(bar, text="vpn-launcher-pro v1.0",
+        tk.Label(bar, text="vpn-launcher-pro v1.1",
                  font=FONT_MONO_S, bg=SURFACE, fg=MUTED).pack(
             side="right", padx=8, pady=3)
 
@@ -461,6 +492,19 @@ class VPNLauncher(tk.Tk):
         self._profile_rows.append(row)
 
     def _select_profile(self, name):
+        # If a VPN is active and user is switching to a different profile, prompt first
+        if name != self._selected:
+            with self._process_lock:
+                vpn_active = self._wg_active or self._connecting or bool(
+                    self.process and self.process.poll() is None)
+            if vpn_active:
+                if not messagebox.askyesno(
+                    "VPN Active",
+                    f"A VPN tunnel is currently active.\n\nDisconnect and switch to '{name}'?"
+                ):
+                    return
+                self.disconnect()
+
         self._selected = name
         for row in self._profile_rows:
             active = row._name == name
@@ -481,6 +525,7 @@ class VPNLauncher(tk.Tk):
             self.vpn_dir = folder
             self.folder_var.set(folder)
             self.load_profiles()
+            self._save_config()
 
     def load_profiles(self):
         self.vpn_dir = self.folder_var.get()
@@ -500,7 +545,10 @@ class VPNLauncher(tk.Tk):
             kind = "wg" if f.endswith(".conf") else "ovpn"
             self._add_profile_row(name, i + 1, kind)
 
-        first = os.path.basename(files[0])
+        # Restore last used profile if still present, else fall back to first
+        all_names = [os.path.basename(f) for f in files]
+        last = getattr(self, "_last_profile", "")
+        first = last if last in all_names else os.path.basename(files[0])
         self._select_profile(first)
         self.write_log(
             f"loaded {len(ovpn)} ovpn  +  {len(wg)} wireguard profile(s) from {self.vpn_dir}",
@@ -510,6 +558,10 @@ class VPNLauncher(tk.Tk):
     def write_log(self, msg, tag="info"):
         ts = time.strftime("%H:%M:%S")
         self.log.configure(state="normal")
+        # Keep log to last 500 lines to prevent unbounded memory growth
+        line_count = int(self.log.index("end-1c").split(".")[0])
+        if line_count > 500:
+            self.log.delete("1.0", f"{line_count - 500}.0")
         self.log.insert("end", f"[{ts}] ", "dim")
         self.log.insert("end", msg + "\n", tag)
         self.log.see("end")
@@ -586,7 +638,9 @@ class VPNLauncher(tk.Tk):
         self._active_profile = profile
         self._active_type    = kind
 
+        self._save_config()
         self._on_connecting()
+        self._start_connect_timeout()
 
         if kind == "wg":
             self._connect_wireguard(profile)
@@ -666,6 +720,7 @@ class VPNLauncher(tk.Tk):
                         or "FATAL ERROR" in upper
                     ):
                         self.after(0, lambda: (
+                            self._cancel_connect_timeout(),
                             self.write_log("connection failed", "err"),
                             self._title_status.configure(text="[ FAILED ]", fg=DANGER),
                             self._lbl_status.configure(text="FAILED", fg=DANGER),
@@ -823,7 +878,29 @@ class VPNLauncher(tk.Tk):
         self._lbl_status.configure(text="CONNECTING", fg=WARN)
         self._set_statusbar("connecting…  waiting for tunnel")
 
+    def _start_connect_timeout(self, seconds=60):
+        """Abort a stuck connection attempt after `seconds` with no response."""
+        self._cancel_connect_timeout()
+        self._connect_timeout_id = self.after(seconds * 1000, self._on_connect_timeout)
+
+    def _cancel_connect_timeout(self):
+        if self._connect_timeout_id:
+            self.after_cancel(self._connect_timeout_id)
+            self._connect_timeout_id = None
+
+    def _on_connect_timeout(self):
+        self._connect_timeout_id = None
+        with self._process_lock:
+            still_connecting = self._connecting
+        if still_connecting:
+            self.write_log("connection timed out after 60s — aborting", "err")
+            self._title_status.configure(text="[ TIMEOUT ]", fg=DANGER)
+            self._lbl_status.configure(text="TIMEOUT", fg=DANGER)
+            self._set_statusbar("connection timed out")
+            self.disconnect()
+
     def _on_connected(self):
+        self._cancel_connect_timeout()
         self._title_status.configure(text="[ CONNECTED ]", fg=SUCCESS)
         self._lbl_status.configure(text="ONLINE", fg=SUCCESS)
         self._set_statusbar(f"tunnel up  ▸  {self._selected}")
@@ -910,6 +987,7 @@ class VPNLauncher(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _reset_disconnected_ui(self):
+        self._cancel_connect_timeout()
         with self._process_lock:
             self.process = None
             self._active_profile = None
