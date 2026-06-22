@@ -1,4 +1,4 @@
-# VPN Launcher Pro — Python dependencies
+# VPN Launcher Pro v1.1 — Python dependencies
 #
 # Install with:
 #   pip install -r requirements.txt --break-system-packages
