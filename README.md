@@ -1,15 +1,13 @@
 # VPN Launcher Pro
 
-Made with ❤️ from Kenya 🇰🇪
+Made with ❤️.
 
 A simple GUI for switching between OpenVPN profiles on Linux — no terminal required.
 
 Built for people who use **HackTheBox**, **TryHackMe**, **OffSec/PG** and similar platforms where you juggle multiple `.ovpn` files and want to connect without typing `sudo openvpn --config ...` every time.
 
-
-<img width="1920" height="1043" alt="Vpn launcher online" src="https://github.com/user-attachments/assets/fb3416e4-84d2-4ae7-9b3d-d8de2d8b5f15" />
-<img width="1920" height="1030" alt="Vpn launcher offline" src="https://github.com/user-attachments/assets/3cac8deb-4fe4-4b3c-bd03-23566e221d60" />
-
+<img width="1920" height="1045" alt="disconnected" src="https://github.com/user-attachments/assets/541bf066-26e7-472e-977c-7fe3f6e4203b" />
+<img width="1917" height="1041" alt="connected" src="https://github.com/user-attachments/assets/af3002ec-b852-4da5-8dad-dad153ad656f" />
 
 ---
 
@@ -36,6 +34,10 @@ This replaces all of that with a desktop icon you double-click. Pick a profile, 
 - Shows tunnel IP, connection status, and session uptime
 - Search box to filter profiles by name
 - Minimises to system tray — stays running in the background
+- **Persistent config** — folder path and last-used profile saved across restarts (`~/.config/vpn-launcher/config.json`)
+- **Connection timeout** — auto-aborts after 60 seconds if the tunnel never comes up
+- **Profile switch guard** — prompts before switching profiles while a tunnel is active
+- **Log size cap** — log trimmed to 500 lines to prevent memory growth on long sessions
 - No terminal needed after setup
 
 ---
@@ -43,6 +45,7 @@ This replaces all of that with a desktop icon you double-click. Pick a profile, 
 ## Requirements
 
 - Linux (Kali, Ubuntu, Debian, Arch, etc.)
+- X11 or XWayland
 - `openvpn`
 - `polkit` / `pkexec` — for the privilege prompt when connecting
 - `python3-tk` — Tkinter GUI library
@@ -158,11 +161,11 @@ Click **[ DISCONNECT ]**. The tunnel closes, status returns to **OFFLINE**, and 
 
 ### Switching between platforms
 
-Click a different profile and hit **[ CONNECT ]** — if you are already connected, disconnect first, then reconnect with the new profile.
+Click a different profile in the sidebar. If a tunnel is currently active, the app will prompt you to confirm before disconnecting and switching. Confirm to disconnect the current tunnel and select the new profile, or cancel to keep the current connection.
 
 ### Using a different folder
 
-If your `.ovpn` files are not in `~/Desktop/vpn/`, click **[browse]** to pick a different folder, or type the path directly into the folder field and click **[reload]**. The app remembers the path for the current session.
+If your `.ovpn` files are not in `~/Desktop/vpn/`, click **[browse]** to pick a different folder, or type the path directly into the folder field and click **[reload]**. The app saves the folder path to `~/.config/vpn-launcher/config.json` and restores it automatically on next launch.
 
 ### WireGuard profiles
 
@@ -217,6 +220,22 @@ Once the tunnel is up, the app scans all `tun*` interfaces via `ip -4 addr` to f
 
 Disconnect runs an inline shell script via `pkexec sh -c '...'` as root. The script sends SIGTERM to openvpn, waits up to ~5 seconds for a clean exit, then escalates to SIGKILL if the process is still alive. This kills all openvpn processes cleanly regardless of how they were spawned. The polkit rule installed by `install.sh` allows this without a password prompt for the installing user.
 
+### Config persistence
+
+On every connect and folder change, the app writes `~/.config/vpn-launcher/config.json` with the current folder path and selected profile name. On next launch, `_load_config()` restores both — so the app opens in the same state you left it.
+
+### Connection timeout
+
+When Connect is clicked, a 60-second timer starts. If `Initialization Sequence Completed` hasn't appeared in the log by then (pkexec was cancelled, OpenVPN hung, network unreachable), the timer fires `_on_connect_timeout()`, which aborts the connection and shows `[ TIMEOUT ]`. The timer is cancelled immediately if the tunnel comes up or if an auth/TLS failure is detected first.
+
+### Profile switch guard
+
+Clicking a different profile while a tunnel is active triggers a yes/no dialog. Confirming calls `disconnect()` before switching selection. Cancelling leaves the current tunnel and selection untouched.
+
+### Log size cap
+
+`write_log()` checks the line count before every insert and trims to the last 500 lines. This prevents the Tkinter Text widget growing unboundedly during long sessions.
+
 ---
 
 ## File structure
@@ -240,6 +259,9 @@ after install:
 ~/.local/share/applications/
 └── VPN_Launcher.desktop         ← app menu entry
 
+~/.config/vpn-launcher/
+└── config.json                  ← saved folder path + last-used profile
+
 ~/Desktop/
 └── VPN_Launcher.desktop         ← desktop shortcut (trusted, double-click to launch)
 
@@ -253,6 +275,18 @@ after install:
 ---
 
 ## Troubleshooting
+
+**App shows `[ TIMEOUT ]` immediately after clicking Connect**
+
+The connection attempt timed out after 60 seconds. Common causes: pkexec password prompt was dismissed, OpenVPN couldn't reach the server, or the `.ovpn` file has an unreachable remote. Check the log pane for details and verify your network connection.
+
+**App not remembering folder path or last profile after restart**
+
+The config is saved to `~/.config/vpn-launcher/config.json`. Check that the directory is writable:
+```bash
+ls -la ~/.config/vpn-launcher/
+cat ~/.config/vpn-launcher/config.json
+```
 
 **Password prompt doesn't appear / nothing happens on Connect**
 
@@ -337,6 +371,19 @@ sudo ip link delete tun0   # repeat for tun1, tun2, etc. as needed
 - Kali Linux 2025.x — GNOME on XWayland
 - OpenVPN 2.7.x
 - HTB, THM, and OffSec/PG `.ovpn` profiles
+
+---
+
+## Changelog
+
+### v1.1
+- **Config persistence** — folder path and last-used profile saved to `~/.config/vpn-launcher/config.json` and restored on launch
+- **Connection timeout** — connection attempts that don't complete within 60 seconds are automatically aborted with a `[ TIMEOUT ]` status
+- **Profile switch guard** — switching profiles while a tunnel is active now prompts for confirmation before disconnecting
+- **Log size cap** — log pane trimmed to 500 lines to prevent memory growth on long sessions
+
+### v1.0
+- Initial release — OpenVPN and WireGuard support, system tray, live log, tunnel IP detection, search, polkit-based passwordless disconnect
 
 ---
 
