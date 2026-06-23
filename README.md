@@ -1,6 +1,6 @@
 # VPN Launcher Pro
 
-Made with ❤️.
+Made with ❤️ from Kenya 🇰🇪 
 
 A simple GUI for switching between OpenVPN profiles on Linux — no terminal required.
 
