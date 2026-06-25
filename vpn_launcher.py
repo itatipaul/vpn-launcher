@@ -6,13 +6,19 @@ Pure tkinter, zero extra deps. Works on X11 and XWayland.
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import subprocess, threading, os, glob, time, json
+import subprocess, threading, os, glob, time, json, shutil
 try:
     import pystray
     from PIL import Image as PILImage
     _TRAY_AVAILABLE = True
 except ImportError:
     _TRAY_AVAILABLE = False
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
 
 # ── Palette ────────────────────────────────────────────────────────────────
 BG       = "#0c0c0c"
@@ -36,7 +42,10 @@ FONT_MONO_SB=("DejaVu Sans Mono", 9, "bold")
 CONFIG_FILE = os.path.expanduser("~/.config/vpn-launcher/config.json")
 
 
-class VPNLauncher(tk.Tk):
+_BaseClass = TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk
+
+
+class VPNLauncher(_BaseClass):
     def __init__(self):
         super().__init__()
         self.title("vpn-launcher")
@@ -62,12 +71,19 @@ class VPNLauncher(tk.Tk):
         self._connecting = False                # prevents double-click races
         self._ip_probe_cancel = threading.Event()  # signals probe thread to stop
         self._connect_timeout_id = None         # pending after() id for connection timeout
+        self._rx_bytes = 0                      # cumulative RX at tunnel start
+        self._tx_bytes = 0                      # cumulative TX at tunnel start
+        self._traffic_iface = None              # active tun/wg interface for traffic polling
+        self._traffic_poll_id = None            # pending after() id for traffic polling
+        self._folder_snapshot = set()           # filenames seen on last load, for auto-reload
+        self._folder_watch_id = None            # pending after() id for folder watcher
 
         self._load_config()
 
         self._build()
         self.load_profiles()
         self._blink_cursor()
+        self._watch_folder()
         self.after(100, self._set_window_icon)  # defer until window is mapped
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -97,6 +113,139 @@ class VPNLauncher(tk.Tk):
                 }, f, indent=2)
         except OSError:
             pass  # non-fatal — config save failure shouldn't crash the app
+
+    # ── Drag-and-drop import ───────────────────────────────────────────────
+
+    def _on_profile_drop(self, event):
+        """Handle files dropped onto the profile list.
+
+        Accepts one or more .ovpn / .conf files and copies them into the
+        current profiles folder, then reloads the list.
+        """
+        # tkinterdnd2 returns a Tcl list string; parse it properly.
+        raw = event.data.strip()
+        # Tcl wraps paths with spaces in braces: {/path/with spaces/file.ovpn}
+        import re as _re
+        paths = _re.findall(r'\{([^}]+)\}|(\S+)', raw)
+        paths = [a or b for a, b in paths]
+
+        imported = []
+        skipped  = []
+
+        for path in paths:
+            if not os.path.isfile(path):
+                skipped.append(os.path.basename(path))
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in (".ovpn", ".conf"):
+                skipped.append(os.path.basename(path))
+                continue
+            dest = os.path.join(self.vpn_dir, os.path.basename(path))
+            try:
+                shutil.copy2(path, dest)
+                imported.append(os.path.basename(path))
+            except OSError as e:
+                self.write_log(f"import failed: {os.path.basename(path)} — {e}", "err")
+
+        if imported:
+            self.write_log(
+                f"imported {len(imported)} profile(s): {', '.join(imported)}", "ok")
+            self.load_profiles()
+            # Auto-select the first newly imported profile
+            self._select_profile(imported[0])
+
+        if skipped:
+            self.write_log(
+                f"skipped {len(skipped)} file(s) (not .ovpn/.conf): {', '.join(skipped)}", "warn")
+
+    # ── Traffic stats ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_bytes(n):
+        """Format byte count as human-readable string."""
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def _read_iface_bytes(self, iface):
+        """Read (rx_bytes, tx_bytes) for *iface* from /proc/net/dev.
+
+        Returns (None, None) if the interface is not found.
+        """
+        try:
+            with open("/proc/net/dev") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if parts and parts[0].rstrip(":") == iface:
+                        # /proc/net/dev columns (after iface):
+                        # rx: bytes packets errs drop fifo frame compressed multicast
+                        # tx: bytes packets errs drop fifo colls carrier compressed
+                        return int(parts[1]), int(parts[9])
+        except (OSError, IndexError, ValueError):
+            pass
+        return None, None
+
+    def _start_traffic_poll(self, iface):
+        """Begin polling /proc/net/dev every second for RX/TX on *iface*."""
+        self._stop_traffic_poll()
+        self._traffic_iface = iface
+        # Snapshot baseline so counters start from 0 at connect time.
+        rx0, tx0 = self._read_iface_bytes(iface)
+        self._rx_bytes = rx0 or 0
+        self._tx_bytes = tx0 or 0
+        self._lbl_rx.configure(text="0 B", fg=SUCCESS)
+        self._lbl_tx.configure(text="0 B", fg=SUCCESS)
+        self._poll_traffic()
+
+    def _poll_traffic(self):
+        iface = self._traffic_iface
+        if not iface:
+            return
+        rx, tx = self._read_iface_bytes(iface)
+        if rx is not None:
+            self._lbl_rx.configure(
+                text=self._fmt_bytes(max(0, rx - self._rx_bytes)), fg=SUCCESS)
+            self._lbl_tx.configure(
+                text=self._fmt_bytes(max(0, tx - self._tx_bytes)), fg=SUCCESS)
+        self._traffic_poll_id = self.after(1000, self._poll_traffic)
+
+    def _stop_traffic_poll(self):
+        if self._traffic_poll_id:
+            self.after_cancel(self._traffic_poll_id)
+            self._traffic_poll_id = None
+        self._traffic_iface = None
+        self._lbl_rx.configure(text="0 B", fg=MUTED)
+        self._lbl_tx.configure(text="0 B", fg=MUTED)
+
+    # ── Auto-reload folder watcher ─────────────────────────────────────────
+
+    def _folder_files(self):
+        """Return the current set of .ovpn/.conf filenames in vpn_dir."""
+        try:
+            return {
+                f for f in os.listdir(self.vpn_dir)
+                if f.endswith(".ovpn") or f.endswith(".conf")
+            }
+        except OSError:
+            return set()
+
+    def _watch_folder(self):
+        """Poll the profiles folder every 2 s and reload if contents changed."""
+        if self._folder_watch_id:
+            self.after_cancel(self._folder_watch_id)
+        current = self._folder_files()
+        if current != self._folder_snapshot:
+            self._folder_snapshot = current
+            # Only auto-reload if triggered by an external change (not the
+            # initial load, which sets the snapshot itself).
+            if hasattr(self, "_folder_watch_initialised"):
+                self.write_log("profiles folder changed — reloading", "dim")
+                self.load_profiles()
+            else:
+                self._folder_watch_initialised = True
+        self._folder_watch_id = self.after(2000, self._watch_folder)
 
     # ── System tray ────────────────────────────────────────────────────────
 
@@ -301,6 +450,15 @@ class VPNLauncher(tk.Tk):
         self._list_inner.bind("<Configure>", self._on_list_resize)
         self._list_canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # Drag-and-drop: accept .ovpn / .conf files dropped onto the list
+        if _DND_AVAILABLE:
+            self._list_canvas.drop_target_register(DND_FILES)
+            self._list_canvas.dnd_bind("<<Drop>>", self._on_profile_drop)
+            # Visual hint in the profiles header when DnD is available
+            tk.Label(sb, text="  drag .ovpn / .conf here to import",
+                     font=("DejaVu Sans Mono", 8), bg=BG, fg=MUTED,
+                     anchor="w").pack(fill="x", padx=8, pady=(0, 2))
+
         # Divider above buttons
         tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(4, 4))
 
@@ -333,6 +491,8 @@ class VPNLauncher(tk.Tk):
         self._lbl_status = self._stat_block(stats, "STATUS",   "OFFLINE",   MUTED)
         self._lbl_ip     = self._stat_block(stats, "TUNNEL-IP","───────",   MUTED)
         self._lbl_uptime = self._stat_block(stats, "UPTIME",   "00:00:00",  MUTED)
+        self._lbl_rx     = self._stat_block(stats, "↓ DOWNLOAD", "0 B",     MUTED)
+        self._lbl_tx     = self._stat_block(stats, "↑ UPLOAD",   "0 B",     MUTED)
 
         # Log header — single line
         log_hdr = tk.Frame(main, bg=BG)
@@ -406,7 +566,7 @@ class VPNLauncher(tk.Tk):
             font=FONT_MONO_S, bg=SURFACE, fg=MUTED)
         self._status_bar_text.pack(side="left", pady=3)
 
-        tk.Label(bar, text="vpn-launcher-pro v1.1",
+        tk.Label(bar, text="vpn-launcher-pro v1.2",
                  font=FONT_MONO_S, bg=SURFACE, fg=MUTED).pack(
             side="right", padx=8, pady=3)
 
@@ -533,6 +693,7 @@ class VPNLauncher(tk.Tk):
         wg    = sorted(glob.glob(os.path.join(self.vpn_dir, "*.conf")))
         files = ovpn + wg
         self._profiles = files
+        self._folder_snapshot = {os.path.basename(f) for f in files}  # keep watcher in sync
         self._clear_list()
 
         if not files:
@@ -862,6 +1023,7 @@ class VPNLauncher(tk.Tk):
                             text=ip, fg=SUCCESS))
                         self.after(0, lambda ip=ip: self.write_log(
                             f"tunnel ip  ▸  {ip}", "ok"))
+                        self.after(0, lambda i=iface: self._start_traffic_poll(i))
                         return
                 except subprocess.CalledProcessError:
                     pass
@@ -996,6 +1158,7 @@ class VPNLauncher(tk.Tk):
             self._connecting = False
 
         self._stop_timer()
+        self._stop_traffic_poll()
 
         self._title_status.configure(
             text="[ DISCONNECTED ]",
@@ -1011,6 +1174,9 @@ class VPNLauncher(tk.Tk):
             text="───────",
             fg=MUTED
         )
+
+        self._lbl_rx.configure(text="0 B", fg=MUTED)
+        self._lbl_tx.configure(text="0 B", fg=MUTED)
 
         self._set_statusbar("disconnected")
 
