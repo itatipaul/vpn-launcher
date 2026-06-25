@@ -6,8 +6,9 @@ A simple GUI for switching between OpenVPN profiles on Linux — no terminal req
 
 Built for people who use **HackTheBox**, **TryHackMe**, **OffSec/PG** and similar platforms where you juggle multiple `.ovpn` files and want to connect without typing `sudo openvpn --config ...` every time.
 
-<img width="1920" height="1045" alt="disconnected" src="https://github.com/user-attachments/assets/541bf066-26e7-472e-977c-7fe3f6e4203b" />
-<img width="1917" height="1041" alt="connected" src="https://github.com/user-attachments/assets/af3002ec-b852-4da5-8dad-dad153ad656f" />
+<img width="1920" height="1045" alt="Connected" src="https://github.com/user-attachments/assets/80e1322f-6891-458d-852b-6a8a2bed0014" />
+<img width="1920" height="1043" alt="Disconnected" src="https://github.com/user-attachments/assets/18db3064-8485-4290-8f30-80e507ad2b47" />
+
 
 ---
 
@@ -30,6 +31,9 @@ This replaces all of that with a desktop icon you double-click. Pick a profile, 
 - One-click connect and disconnect from the desktop
 - Supports **OpenVPN** (`.ovpn`) and **WireGuard** (`.conf`) profiles
 - Loads all profiles from a folder automatically — each tagged `[ovpn]` or `[wg]`
+- **Profile import via drag and drop** — drag `.ovpn` / `.conf` files directly onto the profile list to copy them into your profiles folder instantly (`tkinterdnd2` required)
+- **Live upload / download stats** — RX and TX counters update every second while a tunnel is active, reading directly from `/proc/net/dev`
+- **Auto-reload on folder change** — profile list refreshes automatically when files are added or removed from the watched folder (no manual [reload] needed)
 - Live colour-coded OpenVPN log inside the app
 - Shows tunnel IP, connection status, and session uptime
 - Search box to filter profiles by name
@@ -44,8 +48,8 @@ This replaces all of that with a desktop icon you double-click. Pick a profile, 
 
 ## Requirements
 
-- Linux (Kali, Ubuntu, Debian, Arch, etc.)
-- X11 or XWayland
+- Linux (Kali, Ubuntu, Debian, Arch, Fedora, etc.)
+- X11 or XWayland — the GUI is built on Tkinter which uses X11. Most desktop environments (GNOME, KDE, XFCE, i3, bspwm, etc.) support this out of the box, including modern distros running Wayland with the XWayland compatibility layer. Pure Wayland sessions without XWayland are not supported.
 - `openvpn`
 - `polkit` / `pkexec` — for the privilege prompt when connecting
 - `python3-tk` — Tkinter GUI library
@@ -65,19 +69,19 @@ This replaces all of that with a desktop icon you double-click. Pick a profile, 
 ```bash
 sudo apt update
 sudo apt install openvpn wireguard-tools policykit-1 python3-tk fonts-dejavu
-pip install pillow pystray --break-system-packages
+pip install pillow pystray tkinterdnd2 --break-system-packages
 ```
 
 **Arch / Manjaro:**
 ```bash
 sudo pacman -S openvpn wireguard-tools polkit python-tk ttf-dejavu
-pip install pillow pystray
+pip install pillow pystray tkinterdnd2
 ```
 
 **Fedora:**
 ```bash
 sudo dnf install openvpn wireguard-tools polkit python3-tkinter dejavu-sans-mono-fonts
-pip install pillow pystray
+pip install pillow pystray tkinterdnd2
 ```
 
 ### 2. Clone the repo
@@ -186,6 +190,18 @@ If `pystray` is not installed, closing the window quits the app instead.
 ### Searching profiles
 
 Type in the `> search…` box to filter the profile list by name in real time — useful when you have many `.ovpn` files across different platforms or regions.
+
+### Importing profiles via drag and drop
+
+Drag one or more `.ovpn` or `.conf` files from your file manager and drop them onto the profile list. The app copies them into the current profiles folder and reloads the list automatically. Requires `tkinterdnd2` (`pip install tkinterdnd2 --break-system-packages`). If it's not installed, the profile list still works normally — just without drop support.
+
+### Upload / download stats
+
+While a tunnel is active, the **↓ DOWNLOAD** and **↑ UPLOAD** stat blocks show cumulative RX and TX for the session, updating every second. The counters reset to zero each time you connect. Stats are read directly from `/proc/net/dev` — no extra tools needed.
+
+### Auto-reload on folder change
+
+The app watches your profiles folder and automatically refreshes the profile list when `.ovpn` or `.conf` files are added or removed — for example after copying a new profile from your Downloads folder. No need to click **[reload]** manually.
 
 ---
 
@@ -372,9 +388,16 @@ sudo ip link delete tun0   # repeat for tun1, tun2, etc. as needed
 - OpenVPN 2.7.x
 - HTB, THM, and OffSec/PG `.ovpn` profiles
 
+The app is built on standard Linux APIs (`pkexec`, `ip`, `/proc/net/dev`) and pure Python — it should work on any modern Linux distro running X11 or XWayland. Community reports from Ubuntu, Arch, Fedora, KDE, i3, and other setups are welcome.
+
 ---
 
 ## Changelog
+
+### v1.2
+- **Profile import via drag and drop** — drag `.ovpn` / `.conf` files onto the profile list to copy them into the profiles folder and reload instantly (requires `tkinterdnd2`; falls back gracefully if not installed)
+- **Live upload / download stats** — RX and TX counters in the stats bar update every second while a tunnel is active, reading from `/proc/net/dev`; reset to zero on each new connection
+- **Auto-reload on folder change** — profile list refreshes automatically when files are added or removed from the profiles folder
 
 ### v1.1
 - **Config persistence** — folder path and last-used profile saved to `~/.config/vpn-launcher/config.json` and restored on launch
